@@ -33,6 +33,7 @@ import { BackupModule } from './backup/backup.module';
 import { AnchorModule } from './anchor/anchor.module';
 import { CsvImportModule } from './csv-import/csv-import.module';
 import { GraphqlApiModule } from './graphql/graphql.module';
+import { CacheModule } from './cache/cache.module';
 
 @Module({
   imports: [
@@ -98,6 +99,7 @@ import { GraphqlApiModule } from './graphql/graphql.module';
       }),
     }),
 
+    CacheModule,
     HealthModule,
     AuthModule,
     UsersModule,
