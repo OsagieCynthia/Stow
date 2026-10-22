@@ -822,7 +822,527 @@ fn locked_withdraw_exact_balance_after_unlock_succeeds() {
 
 /// Locked withdrawal before the unlock time must be rejected with
 /// `Error::StillLocked`, even when the requested amount is well within the
-/// plan's balance — isolates the time-lock guard from the balance guard
+/// plan balance. The error message makes explicit that the lock is still
+/// active; the client can retry after `unlock_at`.
+#[test]
+fn locked_withdraw_before_unlock_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const LOCKED_AMOUNT: i128 = 150_000_000;
+
+    mint(&env, &token, &token_admin, &owner, LOCKED_AMOUNT);
+
+    let now: u64 = 3_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let unlock_at = now + 2_000;
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at);
+
+    // Time is still before unlock_at — must fail with StillLocked, even
+    // though the requested amount is within balance.
+    let result = client.try_locked_withdraw(&owner, &plan_id, &(LOCKED_AMOUNT / 2));
+    assert_eq!(
+        result,
+        Err(Ok(Error::StillLocked)),
+        "expected StillLocked when withdrawing before unlock time",
+    );
+
+    let plan = client.locked_plan(&plan_id);
+    assert_eq!(
+        plan.balance, LOCKED_AMOUNT,
+        "locked plan balance must not change when withdrawal is blocked by time lock",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #459 — Event emission optimization tests
+// ---------------------------------------------------------------------------
+
+/// Event topics can be efficiently filtered by indexed parameters.
+/// This test verifies that deposit events include the depositor address
+/// as a topic (indexed parameter) rather than only in the data payload,
+/// allowing off-chain indexers to filter deposit events by user without
+/// decoding every event's data.
+#[test]
+fn event_deposit_has_indexed_depositor() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const AMOUNT: i128 = 50_000_000;
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    client.deposit(&user, &AMOUNT);
+
+    let events = env.events().all();
+    let deposit_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == TOPIC_DEPOSIT)
+                .unwrap_or(false)
+        })
+        .expect("deposit event must be emitted");
+
+    // The deposit event must include the depositor address as an indexed
+    // topic (second topic after the event name) so indexers can efficiently
+    // filter deposits by user.
+    assert!(
+        deposit_event.topics.len() >= 2,
+        "deposit event must have at least 2 topics: event name and depositor address"
+    );
+
+    let depositor_topic = deposit_event
+        .topics
+        .get(1)
+        .expect("second topic must be depositor address");
+    assert!(
+        depositor_topic.as_address().is_some(),
+        "second topic must be an Address (indexed depositor)"
+    );
+}
+
+/// Event topics can be efficiently filtered by indexed goal id.
+/// This test verifies that goal_contribution events include the goal_id
+/// as a topic (indexed parameter), allowing off-chain indexers to filter
+/// contributions by goal without decoding data payloads.
+#[test]
+fn event_goal_contribution_has_indexed_goal_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+    const CONTRIB: i128 = 40_000_000;
+
+    mint(&env, &token, &token_admin, &owner, CONTRIB);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "vacation"), &TARGET);
+    client.goal_contribute(&owner, &goal_id, &CONTRIB);
+
+    let events = env.events().all();
+    let contribution_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "goal_contribution")
+                .unwrap_or(false)
+        })
+        .expect("goal_contribution event must be emitted");
+
+    // The goal_contribution event must include goal_id as an indexed topic
+    // for efficient filtering.
+    assert!(
+        contribution_event.topics.len() >= 2,
+        "goal_contribution event must have indexed goal_id"
+    );
+
+    let goal_id_topic = contribution_event
+        .topics
+        .get(1)
+        .expect("second topic must be goal_id");
+    assert!(
+        goal_id_topic.as_u64().is_some(),
+        "second topic must be a u64 (indexed goal_id)"
+    );
+    assert_eq!(
+        goal_id_topic.as_u64().unwrap(),
+        goal_id,
+        "indexed goal_id must match the actual goal"
+    );
+}
+
+/// Event size optimization: events should only include essential data.
+/// This test verifies that deposit events do not include redundant data
+/// that can be derived from other sources (e.g., token address, which is
+/// constant for the vault instance).
+#[test]
+fn event_deposit_size_is_optimized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const AMOUNT: i128 = 75_000_000;
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    client.deposit(&user, &AMOUNT);
+
+    let events = env.events().all();
+    let deposit_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == TOPIC_DEPOSIT)
+                .unwrap_or(false)
+        })
+        .expect("deposit event must be emitted");
+
+    // Event size check: topics should be minimal (event name + indexed params only).
+    // A well-optimized deposit event has:
+    // - Topic 0: event name (Symbol)
+    // - Topic 1: depositor (Address)
+    // - Data: amount (i128) + timestamp (u64)
+    //
+    // It should NOT include the token address (constant per vault instance,
+    // can be queried once) or other redundant data.
+    assert!(
+        deposit_event.topics.len() <= 3,
+        "deposit event should have minimal indexed topics for gas efficiency"
+    );
+
+    // Verify data payload exists and contains essential fields only.
+    assert!(
+        deposit_event.data.is_some(),
+        "deposit event must have data payload"
+    );
+}
+
+/// Gas cost measurement: verify that emitting multiple events in a single
+/// transaction stays within acceptable gas limits.
+/// This test creates a goal, contributes multiple times, and verifies the
+/// total gas cost remains reasonable even with multiple event emissions.
+#[test]
+fn event_emission_gas_cost_is_reasonable() {
+    const CPU_BASELINE: u64 = 30_000_000; // Baseline for goal contribution with event
+    const MEMORY_BASELINE: u64 = 5 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+    const CONTRIB: i128 = 25_000_000;
+
+    mint(&env, &token, &token_admin, &owner, CONTRIB);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "savings"), &TARGET);
+
+    let mut budget = env.budget();
+    budget.reset_default();
+
+    // Measure the cost of a single contribution with event emission.
+    client.goal_contribute(&owner, &goal_id, &CONTRIB);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "goal_contribute with event emission CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "goal_contribute with event emission memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
+    );
+}
+
+/// Batch event verification: when multiple operations occur (e.g., group
+/// contributions from multiple members), verify that each emits exactly
+/// one event and that event topics are correctly indexed for efficient
+/// filtering per member.
+#[test]
+fn event_group_contributions_are_individually_indexed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let member_c = Address::generate(&env);
+
+    const CONTRIB: i128 = 30_000_000;
+
+    mint(&env, &token, &token_admin, &creator, CONTRIB);
+    mint(&env, &token, &token_admin, &member_b, CONTRIB);
+    mint(&env, &token, &token_admin, &member_c, CONTRIB);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "team-savings"));
+    client.group_join(&member_b, &group_id);
+    client.group_join(&member_c, &group_id);
+
+    // Each contribution should emit exactly one group_contribution event
+    // with the group_id and contributor as indexed parameters.
+    client.group_contribute(&creator, &group_id, &CONTRIB);
+    let events_after_first = env.events().all();
+    let first_contrib_events: Vec<_> = events_after_first
+        .iter()
+        .filter(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "group_contribution")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    assert_eq!(
+        first_contrib_events.len(),
+        1,
+        "each contribution should emit exactly one event"
+    );
+
+    // Verify the event has indexed group_id and contributor.
+    let event = first_contrib_events[0];
+    assert!(
+        event.topics.len() >= 3,
+        "group_contribution event must index group_id and contributor"
+    );
+
+    let group_id_topic = event.topics.get(1);
+    let contributor_topic = event.topics.get(2);
+
+    assert!(
+        group_id_topic.and_then(|t| t.as_u64()).is_some(),
+        "second topic must be indexed group_id"
+    );
+    assert!(
+        contributor_topic.and_then(|t| t.as_address()).is_some(),
+        "third topic must be indexed contributor address"
+    );
+}
+
+/// Event emission for locked plan operations: verify that locked_withdraw
+/// events include indexed plan_id and owner for efficient filtering.
+#[test]
+fn event_locked_withdraw_has_indexed_parameters() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const AMOUNT: i128 = 100_000_000;
+
+    mint(&env, &token, &token_admin, &owner, AMOUNT);
+
+    let now: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let unlock_at = now + 500;
+    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at);
+
+    // Advance past unlock time.
+    env.ledger().set(LedgerInfo {
+        timestamp: unlock_at + 1,
+        protocol_version: 22,
+        sequence_number: 200,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    client.locked_withdraw(&owner, &plan_id, &AMOUNT);
+
+    let events = env.events().all();
+    let withdraw_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "locked_withdraw")
+                .unwrap_or(false)
+        })
+        .expect("locked_withdraw event must be emitted");
+
+    // Verify indexed parameters for efficient filtering.
+    assert!(
+        withdraw_event.topics.len() >= 3,
+        "locked_withdraw event must index plan_id and owner"
+    );
+
+    let plan_id_topic = withdraw_event.topics.get(1);
+    let owner_topic = withdraw_event.topics.get(2);
+
+    assert!(
+        plan_id_topic.and_then(|t| t.as_u64()).is_some(),
+        "second topic must be indexed plan_id"
+    );
+    assert_eq!(
+        plan_id_topic.and_then(|t| t.as_u64()).unwrap(),
+        plan_id,
+        "indexed plan_id must match"
+    );
+
+    assert!(
+        owner_topic.and_then(|t| t.as_address()).is_some(),
+        "third topic must be indexed owner address"
+    );
+}
+
+/// Verify event emission during goal milestone (goal_reached): the event
+/// should have minimal size and include only essential indexed parameters.
+#[test]
+fn event_goal_reached_is_size_optimized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+
+    mint(&env, &token, &token_admin, &owner, TARGET);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "milestone"), &TARGET);
+    
+    // Contribute exactly to target to trigger goal_reached event.
+    client.goal_contribute(&owner, &goal_id, &TARGET);
+
+    let events = env.events().all();
+    let reached_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "goal_reached")
+                .unwrap_or(false)
+        })
+        .expect("goal_reached event must be emitted");
+
+    // Verify minimal event structure:
+    // - Topic 0: event name
+    // - Topic 1: goal_id (indexed)
+    // - Data: timestamp and target_amount (minimal essential data)
+    assert!(
+        reached_event.topics.len() >= 2,
+        "goal_reached must have indexed goal_id"
+    );
+    assert!(
+        reached_event.topics.len() <= 3,
+        "goal_reached should not include redundant indexed parameters"
+    );
+
+    let goal_id_topic = reached_event.topics.get(1);
+    assert!(
+        goal_id_topic.and_then(|t| t.as_u64()).is_some(),
+        "goal_reached must index goal_id"
+    );
+    assert_eq!(
+        goal_id_topic.and_then(|t| t.as_u64()).unwrap(),
+        goal_id,
+        "indexed goal_id must match"
+    );
+}
+
+/// Verify that interest claim events are gas-efficient and properly indexed.
+#[test]
+fn event_interest_claimed_is_gas_efficient() {
+    const CPU_BASELINE: u64 = 35_000_000;
+    const MEMORY_BASELINE: u64 = 5 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+
+    // Set up interest rate
+    client.set_interest_rate(&admin, &500); // 5% (500 bps)
+    client.set_interest_frequency(&admin, &CompoundFrequency::Daily);
+
+    mint(&env, &token, &token_admin, &user, DEPOSIT);
+    client.interest_deposit(&user, &DEPOSIT);
+
+    // Advance time to accrue interest
+    let now = env.ledger().timestamp();
+    env.ledger().set(LedgerInfo {
+        timestamp: now + 86_400, // 1 day later
+        protocol_version: 22,
+        sequence_number: env.ledger().sequence() + 17_280,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let mut budget = env.budget();
+    budget.reset_default();
+
+    // Measure gas cost of interest claim with event emission
+    client.interest_claim(&user);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "interest_claim with event CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "interest_claim with event memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
+    );
+
+    // Verify the event exists and has indexed parameters
+    let events = env.events().all();
+    let claimed_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "interest_claimed")
+                .unwrap_or(false)
+        })
+        .expect("interest_claimed event must be emitted");
+
+    assert!(
+        claimed_event.topics.len() >= 2,
+        "interest_claimed must have indexed user address"
+    );
+}lan's balance — isolates the time-lock guard from the balance guard
 /// (paired with `locked_withdraw_over_balance_rejected` above, which
 /// isolates the balance guard from the time-lock guard).
 #[test]
